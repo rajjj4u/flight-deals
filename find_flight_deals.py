@@ -366,7 +366,7 @@ def find_best_deals() -> List[FlightDeal]:
 
     if not all_roundtrips and not all_outbound:
         log.warning("No flight combos found")
-        return []
+        return [], []
 
     # Sort and take top for detail lookup
     all_outbound.sort(key=lambda x: x["outbound_price"])
@@ -451,7 +451,7 @@ def find_best_deals() -> List[FlightDeal]:
     log.info(f"\nTotal deals found: {len(deals)}, New (not sent before): {len(new_deals)}")
 
     if not new_deals:
-        return []
+        return [], top_outbound
 
     # Step 5: Sort by price, take top MAX_DEALS
     new_deals.sort()
