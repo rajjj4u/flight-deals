@@ -5,20 +5,15 @@ on:
     - cron: '0 9 * * *'  # Daily at 9:00 AM UTC
   workflow_dispatch:
 
-permissions:
-  contents: write  # Push state file back
-
 jobs:
   find-flight-deals:
     name: Find Flight Deals & Send to Telegram
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -40,16 +35,3 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python find_flight_deals.py
-
-      - name: Commit state file
-        if: always()
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if [ -f flight_deals_state.json ]; then
-            git add flight_deals_state.json
-            git diff --staged --quiet || git commit -m "chore: update flight deals state [skip ci]"
-            git push
-          fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

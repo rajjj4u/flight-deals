@@ -1,4 +1,4 @@
 # Flight Deal Finder Dependencies
-flights
+flights>=0.10.0
 pydantic>=2.10
 curl_cffi>=0.7.4
