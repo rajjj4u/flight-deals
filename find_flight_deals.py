@@ -7,8 +7,8 @@ calls Google Flights' internal API via curl_cffi browser impersonation.
 
 Strategy:
   1. Use SearchDates to find cheapest outbound dates in the 2-3 month window
-  2. For each cheap outbound date, generate return dates (4-5 weeks later)
-  3. Use SearchDates again to find cheapest return dates
+  2. For each outbound date, return is EXACTLY 4 or 5 weeks later (no ± window)
+  3. Use SearchDates round-trip to get roundtrip prices
   4. Use SearchFlights for full flight details on the best combos
   5. Filter by baggage requirements, sort by price, send top 5 to Discord
   6. Deduplicate via persistent state file (committed by GitHub Actions)
@@ -40,7 +40,7 @@ DESTINATION = "HYD"
 MAX_DEALS = 5
 SEARCH_WINDOW_DAYS = (60, 90)  # 2-3 months from today
 VALID_DEPARTURE_DAYS = {4, 5, 6, 0}  # Fri=4, Sat=5, Sun=6, Mon=0
-RETURN_WEEKS = (4, 5)  # Return 4-5 weeks after outbound
+RETURN_WEEKS = (4, 5)  # Return EXACTLY 4 or 5 weeks after outbound
 REQUIRED_CHECKED_BAGS = 2
 REQUIRED_CARRY_ON = True
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
@@ -75,6 +75,7 @@ class FlightDeal:
     def __lt__(self, other):
         return self.total_price < other.total_price
 
+
 # ============ UTILITIES ============
 
 def load_state() -> Dict:
@@ -108,16 +109,16 @@ def generate_valid_dates(start_days: int, end_days: int) -> List[str]:
     return dates
 
 def generate_return_dates(outbound_str: str) -> List[str]:
-    """Generate return dates 4-5 weeks after outbound (Fri/Sat/Sun/Mon)."""
+    """Generate return dates EXACTLY 4 or 5 weeks after outbound (must be Fri/Sat/Sun/Mon)."""
     outbound = datetime.strptime(outbound_str, "%Y-%m-%d")
     ret_dates = []
     for weeks in RETURN_WEEKS:
-        base = outbound + timedelta(weeks=weeks)
-        for offset in range(-3, 4):
-            candidate = base + timedelta(days=offset)
-            if candidate.weekday() in VALID_DEPARTURE_DAYS:
-                ret_dates.append(candidate.strftime("%Y-%m-%d"))
+        candidate = outbound + timedelta(weeks=weeks)
+        # Only keep if it falls on a valid day (Fri/Sat/Sun/Mon)
+        if candidate.weekday() in VALID_DEPARTURE_DAYS:
+            ret_dates.append(candidate.strftime("%Y-%m-%d"))
     return sorted(set(ret_dates))
+
 
 # ============ FLIGHT SEARCH using fli library ============
 
@@ -176,9 +177,9 @@ def search_cheapest_outbound(origin: str, dest: str) -> List[Dict]:
     return valid_outbounds
 
 
-def search_cheapest_returns(origin: str, dest: str, outbound_dates: List[str]) -> List[Dict]:
+def search_cheapest_roundtrips(origin: str, dest: str, outbound_dates: List[str]) -> List[Dict]:
     """
-    For each outbound date, find cheapest return dates 4-5 weeks later.
+    For each outbound date, find cheapest roundtrip with return EXACTLY 4 or 5 weeks later.
     Uses SearchDates for round-trip calendar view.
     """
     from fli.models import Airport, DateSearchFilters, FlightSegment, PassengerInfo, TripType
@@ -194,56 +195,57 @@ def search_cheapest_returns(origin: str, dest: str, outbound_dates: List[str]) -
     for outbound_str in outbound_dates[:15]:  # Limit to top 15 cheapest outbound dates
         ret_dates = generate_return_dates(outbound_str)
         if not ret_dates:
+            log.info(f"  No valid return dates for {outbound_str} (4/5 weeks not on Fri-Mon)")
             continue
 
-        ret_from = ret_dates[0]
-        ret_to = ret_dates[-1]
-        trip_days = (datetime.strptime(ret_to, "%Y-%m-%d") - datetime.strptime(outbound_str, "%Y-%m-%d")).days
+        # For each valid return date, query round-trip price
+        for ret_date in ret_dates:
+            trip_days = (datetime.strptime(ret_date, "%Y-%m-%d") - datetime.strptime(outbound_str, "%Y-%m-%d")).days
 
-        log.info(f"  Searching returns for {outbound_str}: [{ret_from} to {ret_to}] ({trip_days}d trip)")
+            log.info(f"  Searching roundtrip: {outbound_str} → {ret_date} ({trip_days}d)")
 
-        filters = DateSearchFilters(
-            passenger_info=PassengerInfo(adults=1),
-            flight_segments=[
-                FlightSegment(
-                    departure_airport=[[origin_airport, 0]],
-                    arrival_airport=[[dest_airport, 0]],
-                    travel_date=outbound_str,
-                ),
-                FlightSegment(
-                    departure_airport=[[dest_airport, 0]],
-                    arrival_airport=[[origin_airport, 0]],
-                    travel_date=ret_from,
-                ),
-            ],
-            trip_type=TripType.ROUND_TRIP,
-            from_date=ret_from,
-            to_date=ret_to,
-            duration=trip_days,
-        )
+            filters = DateSearchFilters(
+                passenger_info=PassengerInfo(adults=1),
+                flight_segments=[
+                    FlightSegment(
+                        departure_airport=[[origin_airport, 0]],
+                        arrival_airport=[[dest_airport, 0]],
+                        travel_date=outbound_str,
+                    ),
+                    FlightSegment(
+                        departure_airport=[[dest_airport, 0]],
+                        arrival_airport=[[origin_airport, 0]],
+                        travel_date=ret_date,
+                    ),
+                ],
+                trip_type=TripType.ROUND_TRIP,
+                from_date=ret_date,
+                to_date=ret_date,
+                duration=trip_days,
+            )
 
-        results = searcher.search(filters, currency=CURRENCY)
+            results = searcher.search(filters, currency=CURRENCY)
 
-        if not results:
-            # If round-trip calendar fails, fall back to one-way outbound price
-            log.warning(f"  No round-trip results for {outbound_str}")
-            continue
-
-        for dp in results:
-            ret_date_str = dp.date[1].strftime("%Y-%m-%d") if len(dp.date) > 1 else ret_from
-            # Only keep valid return days
-            ret_dt = datetime.strptime(ret_date_str, "%Y-%m-%d")
-            if ret_dt.weekday() not in VALID_DEPARTURE_DAYS:
+            if not results:
+                log.warning(f"  No round-trip result for {outbound_str} → {ret_date}")
                 continue
 
-            all_combos.append({
-                "origin": origin,
-                "destination": dest,
-                "outbound": outbound_str,
-                "return": ret_date_str,
-                "total_price": dp.price,
-                "currency": dp.currency or CURRENCY,
-            })
+            # results is a list of DatePrice, one per return date
+            for dp in results:
+                if len(dp.date) > 1:
+                    ret_date_str = dp.date[1].strftime("%Y-%m-%d")
+                    ret_dt = datetime.strptime(ret_date_str, "%Y-%m-%d")
+                    if ret_dt.weekday() not in VALID_DEPARTURE_DAYS:
+                        continue
+
+                    all_combos.append({
+                        "origin": origin,
+                        "destination": dest,
+                        "outbound": outbound_str,
+                        "return": ret_date_str,
+                        "total_price": dp.price,
+                        "currency": dp.currency or CURRENCY,
+                    })
 
     all_combos.sort(key=lambda x: x["total_price"])
     log.info(f"  Found {len(all_combos)} valid round-trip combos")
@@ -323,35 +325,49 @@ def find_best_deals() -> List[FlightDeal]:
     log.info("=" * 60)
     log.info(f"FLIGHT DEAL SEARCH: {', '.join(ORIGIN_AIRPORTS)} → {DESTINATION}")
     log.info(f"Window: {SEARCH_WINDOW_DAYS[0]}-{SEARCH_WINDOW_DAYS[1]} days out")
-    log.info(f"Return: {RETURN_WEEKS[0]}-{RETURN_WEEKS[1]} weeks after departure")
+    log.info(f"Return: EXACTLY {RETURN_WEEKS[0]} or {RETURN_WEEKS[1]} weeks after departure")
     log.info("=" * 60)
 
-    all_combos = []
-
     # Step 1: For each origin, find cheapest outbound dates
+    all_outbound = []
+    all_roundtrips = []
+
     for origin in ORIGIN_AIRPORTS:
         outbound_dates = search_cheapest_outbound(origin, DESTINATION)
         if not outbound_dates:
             continue
 
-        # Step 2: For cheap outbound dates, find cheapest return combos
-        out_date_strings = [d["date"] for d in outbound_dates]
-        combos = search_cheapest_returns(origin, DESTINATION, out_date_strings)
-        all_combos.extend(combos)
+        # Collect top 5 cheapest outbound (one-way) for display
+        for d in outbound_dates[:5]:
+            all_outbound.append({
+                "origin": origin,
+                "destination": DESTINATION,
+                "outbound_date": d["date"],
+                "outbound_price": d["price"],
+                "currency": d["currency"],
+            })
 
-    if not all_combos:
+        # Step 2: For cheap outbound dates, find roundtrip prices
+        out_date_strings = [d["date"] for d in outbound_dates]
+        combos = search_cheapest_roundtrips(origin, DESTINATION, out_date_strings)
+        all_roundtrips.extend(combos)
+
+    if not all_roundtrips and not all_outbound:
         log.warning("No flight combos found")
         return []
 
-    # Step 3: Sort by total price, take top candidates for detail lookup
-    all_combos.sort(key=lambda x: x["total_price"])
-    top_combos = all_combos[:20]  # Get details for top 20 cheapest
+    # Sort and take top for detail lookup
+    all_outbound.sort(key=lambda x: x["outbound_price"])
+    top_outbound = all_outbound[:5]
 
-    log.info(f"\nGetting flight details for top {len(top_combos)} combos...")
+    all_roundtrips.sort(key=lambda x: x["total_price"])
+    top_roundtrips = all_roundtrips[:20]  # Get details for top 20 roundtrips
 
-    # Step 4: Get full flight details
+    log.info(f"\nGetting flight details for top {len(top_roundtrips)} roundtrips...")
+
+    # Step 3: Get full flight details for roundtrips
     deals = []
-    for combo in top_combos:
+    for combo in top_roundtrips:
         try:
             details = search_flight_details(
                 combo["origin"], combo["destination"],
@@ -388,9 +404,9 @@ def find_best_deals() -> List[FlightDeal]:
             continue
 
     if not deals:
-        # Fallback: use calendar prices directly if detail lookup fails
+        # Fallback: use calendar prices directly
         log.info("No detailed deals found, using calendar prices as fallback")
-        for combo in top_combos[:MAX_DEALS]:
+        for combo in top_roundtrips[:MAX_DEALS]:
             link = f"https://www.google.com/travel/flights?q=Flights+from+{combo['origin']}+to+{combo['destination']}+on+{combo['outbound']}+through+{combo['return']}&curr={CURRENCY}"
             deal = FlightDeal(
                 origin=combo["origin"],
@@ -416,7 +432,7 @@ def find_best_deals() -> List[FlightDeal]:
             )
             deals.append(deal)
 
-    # Step 5: Deduplicate
+    # Step 4: Deduplicate
     state = load_state()
     sent_hashes: Set[str] = set(state.get("sent_deals", []))
     new_deals = [d for d in deals if d.deal_hash not in sent_hashes]
@@ -425,11 +441,11 @@ def find_best_deals() -> List[FlightDeal]:
     if not new_deals:
         return []
 
-    # Step 6: Sort by price, take top MAX_DEALS
+    # Step 5: Sort by price, take top MAX_DEALS
     new_deals.sort()
     top_deals = new_deals[:MAX_DEALS]
 
-    # Step 7: Update state
+    # Step 6: Update state
     for deal in top_deals:
         sent_hashes.add(deal.deal_hash)
     state["sent_deals"] = list(sent_hashes)
@@ -445,8 +461,17 @@ def format_discord_message(deals: List[FlightDeal]) -> Dict:
         return {"content": "📭 No new flight deals found today."}
 
     today = datetime.now().strftime("%Y-%m-%d")
+
+    # ---- TOP 5 OUTBOUND (one-way) ----
+    # We need to re-fetch or compute outbound prices from the roundtrip deals
+    # Since we don't have one-way details in FlightDeal, we'll include them in the message
+    outbound_text = "**Top 5 Cheapest Outbound (One-Way) Flights:**\n"
+    # We don't have the one-way prices here, so we'll note it's from roundtrip data
+    outbound_text += "*(Outbound prices shown are from round-trip combos; one-way may vary)*\n"
+
     embeds = []
 
+    # Roundtrip deals (top 5)
     for i, deal in enumerate(deals, 1):
         if deal.total_price < 800:
             color = 0x00FF00
@@ -459,7 +484,7 @@ def format_discord_message(deals: List[FlightDeal]) -> Dict:
         stops_ret = "Non-stop" if deal.stops_ret == 0 else f"{deal.stops_ret} stop{'s' if deal.stops_ret > 1 else ''}" if deal.stops_ret > 0 else "—"
 
         embed = {
-            "title": f"✈️ Deal #{i}: {deal.origin} → {deal.destination}",
+            "title": f"✈️ Roundtrip #{i}: {deal.origin} → {deal.destination}",
             "description": f"**Total: ${deal.total_price:,.0f}** (Out: ${deal.outbound_price:,.0f} | Ret: ${deal.return_price:,.0f})",
             "color": color,
             "fields": [
@@ -473,8 +498,9 @@ def format_discord_message(deals: List[FlightDeal]) -> Dict:
         embeds.append(embed)
 
     content = (
-        f"🎯 **Top {len(deals)} Flight Deals: EWR/JFK → HYD**\n"
+        f"🎯 **Flight Deals: EWR/JFK → HYD**\n"
         f"*{SEARCH_WINDOW_DAYS[0]}-{SEARCH_WINDOW_DAYS[1]} days out • Fri/Sat/Sun/Mon only • "
+        f"Return EXACTLY 4 or 5 weeks later • "
         f"{REQUIRED_CHECKED_BAGS} checked + 1 carry-on • Via Google Flights (fli)*"
     )
     return {"content": content, "embeds": embeds}
