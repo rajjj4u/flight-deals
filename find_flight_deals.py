@@ -463,7 +463,8 @@ def find_best_deals() -> List[FlightDeal]:
     state["sent_deals"] = list(sent_hashes)
     save_state(state)
 
-    return top_deals
+    # Return both roundtrip deals and top outbound one-way flights
+    return top_deals, top_outbound
 
 
 # ============ TELEGRAM DELIVERY ============
@@ -555,13 +556,10 @@ def main():
     log.info("🚀 Starting Flight Deal Finder (fli / Google Flights)")
 
     try:
-        deals = find_best_deals()
+        deals, top_outbound = find_best_deals()
 
         if deals:
-            # We need to re-fetch top_outbound for the message
-            # For now, we'll just send the roundtrip deals
-            # A better approach would be to return both from find_best_deals
-            message = format_telegram_message(deals, [])  # empty outbound for now
+            message = format_telegram_message(deals, top_outbound)
             send_telegram(message)
             log.info(f"\n✅ Sent {len(deals)} deals to Telegram")
             for d in deals:
