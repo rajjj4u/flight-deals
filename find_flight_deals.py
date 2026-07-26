@@ -181,24 +181,31 @@ def _search_roundtrip_sync(origin: str, dest: str, outbound: str, return_date: s
     if not results:
         return None
 
+    # Filter results for EXACTLY 4 or 5 week returns (with ±1 day tolerance)
     for dp in results:
         if len(dp.date) > 1:
-            # STRICT: verify returned dates match EXACTLY what we requested
             out_str = dp.date[0].strftime("%Y-%m-%d")
             ret_str = dp.date[1].strftime("%Y-%m-%d")
             
-            if out_str != outbound or ret_str != return_date:
-                continue  # Skip - API returned different dates than requested
+            # Verify the return is exactly 4 or 5 weeks after outbound (±1 day)
+            out_dt = datetime.strptime(out_str, "%Y-%m-%d")
+            ret_dt = datetime.strptime(ret_str, "%Y-%m-%d")
+            days_diff = (ret_dt - out_dt).days
             
-            if datetime.strptime(ret_str, "%Y-%m-%d").weekday() in {4, 5, 6, 0}:
-                return {
-                    "origin": origin,
-                    "destination": dest,
-                    "outbound": outbound,
-                    "return": ret_str,
-                    "total_price": dp.price,
-                    "currency": dp.currency or "USD",
-                }
+            if not ((27 <= days_diff <= 29) or (34 <= days_diff <= 36)):
+                continue  # Not 4/5 weeks
+            
+            if ret_dt.weekday() not in {4, 5, 6, 0}:
+                continue  # Not Fri/Sat/Sun/Mon
+            
+            return {
+                "origin": origin,
+                "destination": dest,
+                "outbound": out_str,
+                "return": ret_str,
+                "total_price": dp.price,
+                "currency": dp.currency or "USD",
+            }
     return None
 
 
