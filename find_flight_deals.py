@@ -84,8 +84,16 @@ class FlightDeal:
 
 def load_state() -> Dict:
     if STATE_FILE.exists():
-        with open(STATE_FILE) as f:
-            return json.load(f)
+        try:
+            with open(STATE_FILE) as f:
+                content = f.read().strip()
+                if not content:
+                    return {"sent_deals": [], "last_run": None}
+                return json.loads(content)
+        except json.JSONDecodeError:
+            # Corrupted state file - return default and let it be overwritten
+            log.warning(f"Corrupted state file at {STATE_FILE}, resetting")
+            return {"sent_deals": [], "last_run": None}
     return {"sent_deals": [], "last_run": None}
 
 def save_state(state: Dict):
