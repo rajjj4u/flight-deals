@@ -183,7 +183,13 @@ def _search_roundtrip_sync(origin: str, dest: str, outbound: str, return_date: s
 
     for dp in results:
         if len(dp.date) > 1:
+            # STRICT: verify returned dates match EXACTLY what we requested
+            out_str = dp.date[0].strftime("%Y-%m-%d")
             ret_str = dp.date[1].strftime("%Y-%m-%d")
+            
+            if out_str != outbound or ret_str != return_date:
+                continue  # Skip - API returned different dates than requested
+            
             if datetime.strptime(ret_str, "%Y-%m-%d").weekday() in {4, 5, 6, 0}:
                 return {
                     "origin": origin,
