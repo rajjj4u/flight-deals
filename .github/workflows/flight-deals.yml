@@ -2,69 +2,53 @@ name: Flight Deals EWR/JFK → HYD
 
 on:
   schedule:
-    # Run daily at 9:00 AM UTC
-    - cron: '0 9 * * *'
-  workflow_dispatch:  # Allow manual trigger
+    - cron: '0 9 * * *'  # Daily at 9:00 AM UTC
+  workflow_dispatch:
 
 permissions:
-  contents: write  # Needed to commit state file back
+  contents: write  # Push state file back
 
 jobs:
   find-flight-deals:
     name: Find Flight Deals & Send to Discord
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    
+    timeout-minutes: 10
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Full history for commit
-      
+          fetch-depth: 0
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      
-      - name: Cache pip dependencies
+
+      - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-      
+          key: ${{ runner.os }}-pip-flights-${{ hashFiles('requirements.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
+
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-      
-      - name: Restore state file from repo
-        run: |
-          if [ -f flight_deals_state.json ]; then
-            echo "State file found in repo"
-            cp flight_deals_state.json flight_deals_state.json.bak
-          else
-            echo '{"sent_deals": [], "last_run": null}' > flight_deals_state.json
-          fi
-      
+        run: pip install -r requirements.txt
+
       - name: Run flight deal finder
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: |
-          python find_flight_deals.py
-      
-      - name: Commit and push updated state file
+        run: python find_flight_deals.py
+
+      - name: Commit state file
         if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          
           if [ -f flight_deals_state.json ]; then
             git add flight_deals_state.json
             git diff --staged --quiet || git commit -m "chore: update flight deals state [skip ci]"
             git push
-          else
-            echo "No state file to commit"
           fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
