@@ -10,9 +10,9 @@ permissions:
 
 jobs:
   find-flight-deals:
-    name: Find Flight Deals & Send to Discord
+    name: Find Flight Deals & Send to Telegram
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
@@ -37,7 +37,8 @@ jobs:
 
       - name: Run flight deal finder
         env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python find_flight_deals.py
 
       - name: Commit state file

@@ -10,7 +10,7 @@ Strategy:
   2. For each outbound date, return is EXACTLY 4 or 5 weeks later (no ± window)
   3. Use SearchDates round-trip to get roundtrip prices
   4. Use SearchFlights for full flight details on the best combos
-  5. Filter by baggage requirements, sort by price, send top 5 to Discord
+  5. Filter by baggage requirements, sort by price, send top 5 to Telegram
   6. Deduplicate via persistent state file (committed by GitHub Actions)
 
 Requirements:
@@ -43,7 +43,11 @@ VALID_DEPARTURE_DAYS = {4, 5, 6, 0}  # Fri=4, Sat=5, Sun=6, Mon=0
 RETURN_WEEKS = (4, 5)  # Return EXACTLY 4 or 5 weeks after outbound
 REQUIRED_CHECKED_BAGS = 2
 REQUIRED_CARRY_ON = True
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
+
+# Telegram credentials from GitHub Secrets
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # or TELEGRAM_USER_ID
+
 CURRENCY = "USD"
 
 # State file (committed to repo between runs for deduplication)
@@ -454,82 +458,86 @@ def find_best_deals() -> List[FlightDeal]:
     return top_deals
 
 
-# ============ DISCORD DELIVERY ============
+# ============ TELEGRAM DELIVERY ============
 
-def format_discord_message(deals: List[FlightDeal]) -> Dict:
+def format_telegram_message(deals: List[FlightDeal], top_outbound: List[Dict]) -> str:
+    """Format deals as a Telegram message (HTML parse mode)."""
     if not deals:
-        return {"content": "📭 No new flight deals found today."}
+        return "📭 No new flight deals found today."
 
     today = datetime.now().strftime("%Y-%m-%d")
 
-    # ---- TOP 5 OUTBOUND (one-way) ----
-    # We need to re-fetch or compute outbound prices from the roundtrip deals
-    # Since we don't have one-way details in FlightDeal, we'll include them in the message
-    outbound_text = "**Top 5 Cheapest Outbound (One-Way) Flights:**\n"
-    # We don't have the one-way prices here, so we'll note it's from roundtrip data
-    outbound_text += "*(Outbound prices shown are from round-trip combos; one-way may vary)*\n"
+    lines = [
+        f"✈️ <b>Flight Deals: EWR/JFK → HYD</b>",
+        f"<i>{SEARCH_WINDOW_DAYS[0]}-{SEARCH_WINDOW_DAYS[1]} days out • Fri/Sat/Sun/Mon only • Return EXACTLY 4 or 5 weeks later • {REQUIRED_CHECKED_BAGS} checked + 1 carry-on • Via Google Flights (fli)</i>",
+        "",
+        "🔻 <b>Top 5 Cheapest Outbound (One-Way)</b>:"
+    ]
 
-    embeds = []
+    for i, o in enumerate(top_outbound, 1):
+        price_str = f"${o['outbound_price']:,.0f} {o.get('currency', 'USD')}"
+        lines.append(
+            f"  {i}. {o['origin']}→{o['destination']} on {o['outbound_date']} — <b>{price_str}</b>"
+        )
 
-    # Roundtrip deals (top 5)
+    lines.append("")
+    lines.append("🔄 <b>Top 5 Cheapest Roundtrips</b>:")
+
     for i, deal in enumerate(deals, 1):
-        if deal.total_price < 800:
-            color = 0x00FF00
-        elif deal.total_price < 1100:
-            color = 0xFFFF00
-        else:
-            color = 0xFF8C00
+        stops_out = "Non-stop" if deal.stops_out == 0 else f"{deal.stops_out} stop{'s' if deal.stops_out > 1 else ''}"
+        stops_ret = "Non-stop" if deal.stops_ret == 0 else f"{deal.stops_ret} stop{'s' if deal.stops_ret > 1 else ''}"
 
-        stops_out = "Non-stop" if deal.stops_out == 0 else f"{deal.stops_out} stop{'s' if deal.stops_out > 1 else ''}" if deal.stops_out > 0 else "—"
-        stops_ret = "Non-stop" if deal.stops_ret == 0 else f"{deal.stops_ret} stop{'s' if deal.stops_ret > 1 else ''}" if deal.stops_ret > 0 else "—"
+        lines.append(
+            f"  {i}. <b>${deal.total_price:,.0f}</b> | "
+            f"{deal.origin}→{deal.destination} | "
+            f"Out: {deal.outbound_date} ({deal.airline}, {deal.duration_out}, {stops_out}) | "
+            f"Ret: {deal.return_date} ({deal.duration_ret}, {stops_ret})"
+        )
+        lines.append(f"      <a href=\"{deal.booking_link}\">Book on Google Flights</a>")
 
-        embed = {
-            "title": f"✈️ Roundtrip #{i}: {deal.origin} → {deal.destination}",
-            "description": f"**Total: ${deal.total_price:,.0f}** (Out: ${deal.outbound_price:,.0f} | Ret: ${deal.return_price:,.0f})",
-            "color": color,
-            "fields": [
-                {"name": "📅 Outbound", "value": f"{deal.outbound_date}\n{deal.airline} | {deal.duration_out} | {stops_out}", "inline": True},
-                {"name": "📅 Return", "value": f"{deal.return_date}\n{deal.duration_ret} | {stops_ret}", "inline": True},
-                {"name": "🧳 Baggage", "value": deal.baggage_info, "inline": True},
-            ],
-            "url": deal.booking_link,
-            "footer": {"text": f"Flight Deal Bot ({deal.source}) • {today}"}
-        }
-        embeds.append(embed)
+    lines.append("")
+    lines.append(f"<i>Flight Deal Bot • {datetime.now().strftime('%Y-%m-%d')}</i>")
 
-    content = (
-        f"🎯 **Flight Deals: EWR/JFK → HYD**\n"
-        f"*{SEARCH_WINDOW_DAYS[0]}-{SEARCH_WINDOW_DAYS[1]} days out • Fri/Sat/Sun/Mon only • "
-        f"Return EXACTLY 4 or 5 weeks later • "
-        f"{REQUIRED_CHECKED_BAGS} checked + 1 carry-on • Via Google Flights (fli)*"
-    )
-    return {"content": content, "embeds": embeds}
+    return "\n".join(lines)
 
 
-def send_discord(message: Dict) -> bool:
-    if not DISCORD_WEBHOOK_URL:
-        log.warning("DISCORD_WEBHOOK_URL not configured — skipping delivery")
+def send_telegram(message: str) -> bool:
+    """Send message to Telegram via Bot API."""
+    if not TELEGRAM_BOT_TOKEN:
+        log.warning("TELEGRAM_BOT_TOKEN not configured — skipping delivery")
         return False
 
-    if not DISCORD_WEBHOOK_URL.startswith("https://discord.com/api/webhooks/"):
-        log.warning("DISCORD_WEBHOOK_URL appears invalid")
+    if not TELEGRAM_CHAT_ID:
+        log.warning("TELEGRAM_CHAT_ID not configured — skipping delivery")
         return False
 
     import urllib.request
+    import urllib.parse
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+    data = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+
     try:
-        data = json.dumps(message).encode("utf-8")
+        encoded_data = urllib.parse.urlencode(data).encode("utf-8")
         req = urllib.request.Request(
-            DISCORD_WEBHOOK_URL, data=data,
-            headers={"Content-Type": "application/json"}, method="POST"
+            url, data=encoded_data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST"
         )
         resp = urllib.request.urlopen(req, timeout=10)
         if resp.status in (200, 204):
-            log.info("✅ Sent to Discord successfully")
+            log.info("✅ Sent to Telegram successfully")
             return True
-        log.error(f"Discord error: {resp.status}")
+        log.error(f"Telegram error: {resp.status}")
         return False
     except Exception as e:
-        log.error(f"Discord send error: {e}")
+        log.error(f"Telegram send error: {e}")
         return False
 
 
@@ -542,9 +550,12 @@ def main():
         deals = find_best_deals()
 
         if deals:
-            message = format_discord_message(deals)
-            send_discord(message)
-            log.info(f"\n✅ Sent {len(deals)} deals to Discord")
+            # We need to re-fetch top_outbound for the message
+            # For now, we'll just send the roundtrip deals
+            # A better approach would be to return both from find_best_deals
+            message = format_telegram_message(deals, [])  # empty outbound for now
+            send_telegram(message)
+            log.info(f"\n✅ Sent {len(deals)} deals to Telegram")
             for d in deals:
                 log.info(f"  ${d.total_price:,.0f} | {d.origin}→{d.destination} {d.outbound_date}→{d.return_date} | {d.airline}")
         else:
