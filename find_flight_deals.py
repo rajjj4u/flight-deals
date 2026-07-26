@@ -211,12 +211,24 @@ async def search_outbound(origin: str, dest: str) -> List[Dict]:
 
 
 async def search_roundtrip(origin: str, dest: str, outbound: str, return_date: str) -> Optional[Dict]:
-    """Async wrapper for roundtrip search."""
+    """Async wrapper for roundtrip search with 4/5 week validation."""
+    if not _validate_return_week(outbound, return_date):
+        return None
+    
     loop = asyncio.get_event_loop()
     with ThreadPoolExecutor(max_workers=4) as executor:
         return await loop.run_in_executor(
             executor, _search_roundtrip_sync, origin, dest, outbound, return_date
         )
+
+
+def _validate_return_week(outbound: str, return_date: str) -> bool:
+    """Check if return is exactly 4 or 5 weeks after outbound (±1 day tolerance)."""
+    out_dt = datetime.strptime(outbound, "%Y-%m-%d")
+    ret_dt = datetime.strptime(return_date, "%Y-%m-%d")
+    days_diff = (ret_dt - out_dt).days
+    # 4 weeks = 28 days, 5 weeks = 35 days, allow ±1 day
+    return (27 <= days_diff <= 29) or (34 <= days_diff <= 36)
 
 
 # ============ MAIN PIPELINE ============
@@ -242,13 +254,18 @@ async def find_best_deals() -> tuple:
 
         # Collect top 5 outbound for display
         for d in outbound_results[:5]:
-            all_outbound.append({
-                "origin": origin,
-                "destination": DESTINATION,
-                "outbound_date": d["date"],
-                "outbound_price": d["price"],
-                "currency": d["currency"],
-            })
+                link = (
+                    f"https://www.google.com/travel/flights?q=Flights+from+{origin}+to+{DESTINATION}"
+                    f"+on+{d['date']}&curr=USD"
+                )
+                all_outbound.append({
+                    "origin": origin,
+                    "destination": DESTINATION,
+                    "outbound_date": d["date"],
+                    "outbound_price": d["price"],
+                    "currency": d["currency"],
+                    "booking_link": link,
+                })
 
         # Queue roundtrip searches for top 8 outbound dates
         for d in outbound_results[:8]:
@@ -327,7 +344,15 @@ def format_telegram_message(deals: List, top_outbound: List[Dict]) -> str:
 
     for i, o in enumerate(top_outbound, 1):
         price_str = f"${o['outbound_price']:,.0f} {o.get('currency', 'USD')}"
-        lines.append(f"  {i}. {o['origin']}→{o['destination']} on {o['outbound_date']} — <b>{price_str}</b>")
+        link = o.get('booking_link', '')
+        if link:
+            lines.append(
+                f"  {i}. <a href=\"{link}\">{o['origin']}→{o['destination']}</a> on {o['outbound_date']} — <b>{price_str}</b>"
+            )
+        else:
+            lines.append(
+                f"  {i}. {o['origin']}→{o['destination']} on {o['outbound_date']} — <b>{price_str}</b>"
+            )
 
     lines.append("")
     lines.append("🔄 <b>Top 5 Cheapest Roundtrips</b>:")
