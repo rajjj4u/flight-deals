@@ -198,11 +198,11 @@ def _search_roundtrip_sync(origin: str, dest: str, outbound: str, return_date: s
             ret_dt = datetime.strptime(ret_str, "%Y-%m-%d")
             days_diff = (ret_dt - out_dt).days
             
-            # Allow 2-7 days for weekend trips (Fri-Sun, Sat-Mon, etc.)
-            if not (2 <= days_diff <= 7):
+            # Allow 2-14 days for weekend trips (flexible)
+            if not (2 <= days_diff <= 14):
                 continue
             
-            # Prefer weekend returns (Fri/Sat/Sun/Mon) but allow others
+            # Only require weekend return (Fri/Sat/Sun/Mon)
             if ret_dt.weekday() not in {4, 5, 6, 0}:
                 continue  # Skip weekday returns for weekend trips
             
