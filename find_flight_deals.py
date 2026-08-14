@@ -4,18 +4,6 @@ Flight Deal Finder: NYC → California + Yellowstone (Domestic)
 ==============================================================
 Streamlined version - no state management, fresh search every run.
 Uses fli library (Google Flights API via curl_cffi) with parallel requests.
-
-Strategy:
-  1. SearchDates: one call per origin to get cheapest outbound dates (20-35 days)
-  2. For top 8 outbound dates per origin: SearchDates round-trip for 3-5 day returns
-  3. Return top 5 outbound + top 5 roundtrip combos (no deduplication, always fresh)
-
-Optimizations:
-  - Parallel API calls with asyncio + thread pool
-  - Reduced API calls: ~20 vs ~40 previously
-  - No SearchFlights detail calls (slow) - use SearchDates calendar data
-  - No state file - always fresh search
-  - Target runtime: ~30-60 seconds
 """
 
 import os
@@ -33,7 +21,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("flight_deals")
 
 # ============ CONFIGURATION ============
-
 # NYC Area Airports
 ORIGIN_AIRPORTS = ["JFK", "LGA", "EWR"]
 
@@ -55,8 +42,8 @@ CURRENCY = "USD"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# ============ DATA MODELS ============
 
+# ============ DATA MODELS ============
 @dataclass
 class FlightDeal:
     origin: str
@@ -80,7 +67,6 @@ class FlightDeal:
 
 
 # ============ UTILITIES ============
-
 def generate_valid_dates(start_days: int, end_days: int) -> List[str]:
     """Generate outbound dates (Fri/Sat/Sun/Mon) 20-35 days out."""
     today = datetime.now().date()
@@ -89,7 +75,7 @@ def generate_valid_dates(start_days: int, end_days: int) -> List[str]:
     dates = []
     current = start
     while current <= end:
-        if current.weekday() in {4, 5, 6, 0}:  # Fri, Sat, Sun, Mon
+        if current.weekday() in VALID_DEPARTURE_DAYS:
             dates.append(current.strftime("%Y-%m-%d"))
         current += timedelta(days=1)
     return dates
@@ -99,14 +85,64 @@ def generate_return_dates(outbound_str: str) -> List[str]:
     """Generate return dates 3-5 days after outbound date."""
     outbound = datetime.strptime(outbound_str, "%Y-%m-%d")
     ret_dates = []
-    for days in range(3, 6):  # 3, 4, 5 days
+    for days in range(RETURN_DAYS[0], RETURN_DAYS[1] + 1):
         candidate = outbound + timedelta(days=days)
-        # Allow any return day within the 3-5 day window
         ret_dates.append(candidate.strftime("%Y-%m-%d"))
     return ret_dates
 
 
 # ============ FLIGHT SEARCH (parallelized) ============
+def _search_outbound_sync(origin: str, dest: str, from_date: str, to_date: str) -> List[Dict]:
+    """Synchronous SearchDates for outbound one-way deals across a range."""
+    from fli.models import DateSearchFilters, FlightSegment, PassengerInfo, TripType
+    from fli.search import SearchDates
+    from fli.core import resolve_airport
+
+    try:
+        origin_airport = resolve_airport(origin)
+        dest_airport = resolve_airport(dest)
+
+        filters = DateSearchFilters(
+            passenger_info=PassengerInfo(adults=1),
+            flight_segments=[
+                FlightSegment(
+                    departure_airport=[[origin_airport, 0]],
+                    arrival_airport=[[dest_airport, 0]],
+                )
+            ],
+            trip_type=TripType.ONE_WAY,
+            from_date=from_date,
+            to_date=to_date,
+        )
+
+        searcher = SearchDates()
+        results = searcher.search(filters, currency=CURRENCY)
+
+        if not results:
+            return []
+
+        outbound_deals = []
+        for dp in results:
+            if not dp.date or dp.price is None:
+                continue
+            
+            # Filter for valid departure weekdays (Fri, Sat, Sun, Mon)
+            dt = datetime.strptime(dp.date, "%Y-%m-%d")
+            if dt.weekday() in VALID_DEPARTURE_DAYS:
+                outbound_deals.append({
+                    "origin": origin,
+                    "destination": dest,
+                    "date": dp.date,
+                    "price": dp.price,
+                    "currency": dp.currency or CURRENCY,
+                })
+
+        outbound_deals.sort(key=lambda x: x["price"])
+        return outbound_deals
+    except Exception as e:
+        log.debug(f"Outbound search failed for {origin}->{dest}: {e}")
+        return []
+
 
 def _search_roundtrip_sync(origin: str, dest: str, outbound: str, return_date: str) -> Optional[Dict]:
     """Synchronous SearchDates for one specific round-trip date pair."""
@@ -117,8 +153,10 @@ def _search_roundtrip_sync(origin: str, dest: str, outbound: str, return_date: s
     try:
         origin_airport = resolve_airport(origin)
         dest_airport = resolve_airport(dest)
-        
-        trip_days = (datetime.strptime(return_date, "%Y-%m-%d") - datetime.strptime(outbound, "%Y-%m-%d")).days
+
+        outbound_dt = datetime.strptime(outbound, "%Y-%m-%d")
+        return_dt = datetime.strptime(return_date, "%Y-%m-%d")
+        trip_days = (return_dt - outbound_dt).days
 
         filters = DateSearchFilters(
             passenger_info=PassengerInfo(adults=1),
@@ -141,12 +179,11 @@ def _search_roundtrip_sync(origin: str, dest: str, outbound: str, return_date: s
         )
 
         searcher = SearchDates()
-        results = searcher.search(filters, currency="USD")
+        results = searcher.search(filters, currency=CURRENCY)
 
         if not results:
             return None
 
-        # Take the top pricing result returned for this exact date pair
         best_dp = results[0]
         return {
             "origin": origin,
@@ -154,7 +191,7 @@ def _search_roundtrip_sync(origin: str, dest: str, outbound: str, return_date: s
             "outbound": outbound,
             "return": return_date,
             "total_price": best_dp.price,
-            "currency": best_dp.currency or "USD",
+            "currency": best_dp.currency or CURRENCY,
         }
     except Exception as e:
         log.debug(f"Roundtrip search failed for {origin}->{dest} ({outbound} to {return_date}): {e}")
@@ -185,7 +222,6 @@ async def search_roundtrip(origin: str, dest: str, outbound: str, return_date: s
 
 
 # ============ MAIN PIPELINE ============
-
 async def find_best_deals() -> tuple:
     """Main pipeline: fresh search every run, no state, returns (roundtrip_deals, top_outbound)."""
     log.info("=" * 60)
@@ -195,23 +231,26 @@ async def find_best_deals() -> tuple:
     log.info("=" * 60)
 
     # Step 1: Search outbound dates for all origins IN PARALLEL
-    outbound_tasks = [search_outbound(origin, dest) 
-                      for origin in ORIGIN_AIRPORTS 
-                      for dest in DESTINATION_AIRPORTS]
+    outbound_tasks = [
+        search_outbound(origin, dest)
+        for origin in ORIGIN_AIRPORTS
+        for dest in DESTINATION_AIRPORTS
+    ]
     all_outbound_results = await asyncio.gather(*outbound_tasks)
 
     all_outbound = []
     roundtrip_tasks = []
-
     idx = 0
+
     for origin in ORIGIN_AIRPORTS:
         for dest in DESTINATION_AIRPORTS:
             outbound_results = all_outbound_results[idx]
             idx += 1
+
             if not outbound_results:
                 continue
 
-            # Collect top 5 outbound for display
+            # Collect top outbound options for display
             for d in outbound_results[:5]:
                 link = (
                     f"https://www.google.com/travel/flights?q=Flights+from+{origin}+to+{dest}"
@@ -245,14 +284,14 @@ async def find_best_deals() -> tuple:
         log.warning("No flight combos found")
         return [], []
 
-    # Sort and take top
+    # Sort and take top deals
     all_outbound.sort(key=lambda x: x["outbound_price"])
     top_outbound = all_outbound[:5]
 
     all_combos.sort(key=lambda x: x["total_price"])
     top_combos = all_combos[:5]
 
-    # Build final deals from calendar data
+    # Build final deals
     deals = []
     for combo in top_combos:
         link = (
@@ -282,39 +321,31 @@ async def find_best_deals() -> tuple:
         deals.append(deal)
 
     log.info(f"Built {len(deals)} deals for Telegram")
-    return deals, all_outbound[:5]
+    return deals, top_outbound
 
 
 # ============ TELEGRAM DELIVERY ============
-
 def format_telegram_message(deals: List, top_outbound: List[Dict]) -> str:
     if not deals:
         return "📭 No new flight deals found today."
 
-    today = datetime.now().strftime("%Y-%m-%d")
-
     lines = [
-        f"✈️ <b>Flight Deals: NYC (JFK/LGA/EWR) → CA + Yellowstone</b>",
-        f"<i>20-35 days out • Fri/Sat/Sun/Mon only • Return 3-5 days later • Carry-on only • Via Google Flights (fli)</i>",
+        "✈️ <b>Flight Deals: NYC (JFK/LGA/EWR) → CA + Yellowstone</b>",
+        "<i>20-35 days out • Fri/Sat/Sun/Mon only • Return 3-5 days later • Carry-on only • Via Google Flights (fli)</i>",
         "",
-        "🔻 <b>Top 5 Cheapest Outbound (One-Way)</b>:"
+        "🔻 <b>Top 5 Cheapest Outbound (One-Way)</b>:",
     ]
 
     for i, o in enumerate(top_outbound, 1):
         price_str = f"${o['outbound_price']:,.0f} {o.get('currency', 'USD')}"
-        link = o.get('booking_link', '')
+        link = o.get("booking_link", "")
         if link:
-            lines.append(
-                f"  {i}. <a href=\"{link}\">{o['origin']}→{o['destination']}</a> on {o['outbound_date']} — <b>{price_str}</b>"
-            )
+            lines.append(f"  {i}. <a href=\"{link}\">{o['origin']}→{o['destination']}</a> on {o['outbound_date']} — <b>{price_str}</b>")
         else:
-            lines.append(
-                f"  {i}. {o['origin']}→{o['destination']} on {o['outbound_date']} — <b>{price_str}</b>"
-            )
+            lines.append(f"  {i}. {o['origin']}→{o['destination']} on {o['outbound_date']} — <b>{price_str}</b>")
 
     lines.append("")
     lines.append("🔄 <b>Top 5 Cheapest Roundtrips</b>:")
-
     for i, deal in enumerate(deals, 1):
         lines.append(
             f"  {i}. <b>${deal.total_price:,.0f}</b> | "
@@ -325,7 +356,6 @@ def format_telegram_message(deals: List, top_outbound: List[Dict]) -> str:
 
     lines.append("")
     lines.append(f"<i>Flight Deal Bot • {datetime.now().strftime('%Y-%m-%d')}</i>")
-
     return "\n".join(lines)
 
 
@@ -348,9 +378,10 @@ def send_telegram(message: str) -> bool:
     try:
         encoded = urllib.parse.urlencode(data).encode("utf-8")
         req = urllib.request.Request(
-            url, data=encoded,
+            url,
+            data=encoded,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
-            method="POST"
+            method="POST",
         )
         resp = urllib.request.urlopen(req, timeout=10)
         if resp.status in (200, 204):
@@ -364,13 +395,10 @@ def send_telegram(message: str) -> bool:
 
 
 # ============ ENTRY POINT ============
-
 async def main():
     log.info("🚀 Starting Flight Deal Finder (NYC → CA + Yellowstone)")
-
     try:
         deals, top_outbound = await find_best_deals()
-
         if deals:
             message = format_telegram_message(deals, top_outbound)
             send_telegram(message)
@@ -379,7 +407,6 @@ async def main():
                 log.info(f"  ${d.total_price:,.0f} | {d.origin}→{d.destination} {d.outbound_date}→{d.return_date}")
         else:
             log.info("\n📭 No deals found")
-
     except Exception as e:
         log.error(f"❌ Fatal error: {e}")
         import traceback
