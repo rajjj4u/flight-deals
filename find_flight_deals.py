@@ -96,59 +96,69 @@ def generate_valid_dates(start_days: int, end_days: int) -> List[str]:
 
 
 def generate_return_dates(outbound_str: str) -> List[str]:
-    """Generate return dates 3-5 days after outbound (must be Fri/Sat/Sun/Mon)."""
+    """Generate return dates 3-5 days after outbound date."""
     outbound = datetime.strptime(outbound_str, "%Y-%m-%d")
     ret_dates = []
     for days in range(3, 6):  # 3, 4, 5 days
         candidate = outbound + timedelta(days=days)
-        if candidate.weekday() in {4, 5, 6, 0}:
-            ret_dates.append(candidate.strftime("%Y-%m-%d"))
-    return sorted(set(ret_dates))
+        # Allow any return day within the 3-5 day window
+        ret_dates.append(candidate.strftime("%Y-%m-%d"))
+    return ret_dates
 
 
 # ============ FLIGHT SEARCH (parallelized) ============
 
-def _search_outbound_sync(origin: str, dest: str, from_date: str, to_date: str) -> List[Dict]:
-    """Synchronous SearchDates for one-way outbound prices."""
-    from fli.models import DateSearchFilters, FlightSegment, PassengerInfo
+def _search_roundtrip_sync(origin: str, dest: str, outbound: str, return_date: str) -> Optional[Dict]:
+    """Synchronous SearchDates for one specific round-trip date pair."""
+    from fli.models import DateSearchFilters, FlightSegment, PassengerInfo, TripType
     from fli.search import SearchDates
     from fli.core import resolve_airport
 
-    origin_airport = resolve_airport(origin)
-    dest_airport = resolve_airport(dest)
+    try:
+        origin_airport = resolve_airport(origin)
+        dest_airport = resolve_airport(dest)
+        
+        trip_days = (datetime.strptime(return_date, "%Y-%m-%d") - datetime.strptime(outbound, "%Y-%m-%d")).days
 
-    filters = DateSearchFilters(
-        passenger_info=PassengerInfo(adults=1),
-        flight_segments=[
-            FlightSegment(
-                departure_airport=[[origin_airport, 0]],
-                arrival_airport=[[dest_airport, 0]],
-                travel_date=from_date,
-            )
-        ],
-        from_date=from_date,
-        to_date=to_date,
-    )
+        filters = DateSearchFilters(
+            passenger_info=PassengerInfo(adults=1),
+            flight_segments=[
+                FlightSegment(
+                    departure_airport=[[origin_airport, 0]],
+                    arrival_airport=[[dest_airport, 0]],
+                    travel_date=outbound,
+                ),
+                FlightSegment(
+                    departure_airport=[[dest_airport, 0]],
+                    arrival_airport=[[origin_airport, 0]],
+                    travel_date=return_date,
+                ),
+            ],
+            trip_type=TripType.ROUND_TRIP,
+            from_date=outbound,
+            to_date=return_date,
+            duration=trip_days,
+        )
 
-    searcher = SearchDates()
-    results = searcher.search(filters, currency="USD")
+        searcher = SearchDates()
+        results = searcher.search(filters, currency="USD")
 
-    if not results:
-        return []
+        if not results:
+            return None
 
-    valid = []
-    for dp in results:
-        date_str = dp.date[0].strftime("%Y-%m-%d")
-        if dp.date[0].weekday() in {4, 5, 6, 0}:
-            valid.append({
-                "origin": origin,
-                "destination": dest,
-                "date": date_str,
-                "price": dp.price,
-                "currency": dp.currency or "USD",
-            })
-    valid.sort(key=lambda x: x["price"])
-    return valid
+        # Take the top pricing result returned for this exact date pair
+        best_dp = results[0]
+        return {
+            "origin": origin,
+            "destination": dest,
+            "outbound": outbound,
+            "return": return_date,
+            "total_price": best_dp.price,
+            "currency": best_dp.currency or "USD",
+        }
+    except Exception as e:
+        log.debug(f"Roundtrip search failed for {origin}->{dest} ({outbound} to {return_date}): {e}")
+        return None
 
 
 def _search_roundtrip_sync(origin: str, dest: str, outbound: str, return_date: str) -> Optional[Dict]:
