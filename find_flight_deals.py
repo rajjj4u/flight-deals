@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Flight Deal Finder: EWR/JFK → HYD (Optimized)
-==============================================
+Flight Deal Finder: NYC → California + Yellowstone (Domestic)
+==============================================================
 Streamlined version - no state management, fresh search every run.
 Uses fli library (Google Flights API via curl_cffi) with parallel requests.
 
 Strategy:
-  1. SearchDates: one call per origin to get cheapest outbound dates (60-90 days)
-  2. For top 8 outbound dates per origin: SearchDates round-trip for 4/5 week returns
+  1. SearchDates: one call per origin to get cheapest outbound dates (20-35 days)
+  2. For top 8 outbound dates per origin: SearchDates round-trip for 3-5 day returns
   3. Return top 5 outbound + top 5 roundtrip combos (no deduplication, always fresh)
 
 Optimizations:
@@ -34,13 +34,20 @@ log = logging.getLogger("flight_deals")
 
 # ============ CONFIGURATION ============
 
-ORIGIN_AIRPORTS = ["EWR", "JFK"]
-DESTINATION = "HYD"
+# NYC Area Airports
+ORIGIN_AIRPORTS = ["JFK", "LGA", "EWR"]
+
+# California Airports + Yellowstone
+DESTINATION_AIRPORTS = [
+    "LAX", "SFO", "SAN", "SJC", "OAK", "SMF", "BUR", "ONT", "PSP",  # California
+    "JAC"  # Jackson Hole (Yellowstone/Grand Teton)
+]
+
 MAX_DEALS = 5
-SEARCH_WINDOW_DAYS = (60, 90)  # 2-3 months from today
+SEARCH_WINDOW_DAYS = (20, 35)  # 20-35 days from today for domestic
 VALID_DEPARTURE_DAYS = {4, 5, 6, 0}  # Fri=4, Sat=5, Sun=6, Mon=0
-RETURN_WEEKS = (4, 5)  # Return EXACTLY 4 or 5 weeks after outbound
-REQUIRED_CHECKED_BAGS = 2
+RETURN_DAYS = (3, 5)  # Return 3-5 days after outbound (weekend trips)
+REQUIRED_CHECKED_BAGS = 0  # Domestic - typically no free checked bags
 REQUIRED_CARRY_ON = True
 CURRENCY = "USD"
 
@@ -75,7 +82,7 @@ class FlightDeal:
 # ============ UTILITIES ============
 
 def generate_valid_dates(start_days: int, end_days: int) -> List[str]:
-    """Generate outbound dates (Fri/Sat/Sun/Mon) 60-90 days out."""
+    """Generate outbound dates (Fri/Sat/Sun/Mon) 20-35 days out."""
     today = datetime.now().date()
     start = today + timedelta(days=start_days)
     end = today + timedelta(days=end_days)
@@ -89,11 +96,11 @@ def generate_valid_dates(start_days: int, end_days: int) -> List[str]:
 
 
 def generate_return_dates(outbound_str: str) -> List[str]:
-    """Generate return dates EXACTLY 4 or 5 weeks after outbound (must be Fri/Sat/Sun/Mon)."""
+    """Generate return dates 3-5 days after outbound (must be Fri/Sat/Sun/Mon)."""
     outbound = datetime.strptime(outbound_str, "%Y-%m-%d")
     ret_dates = []
-    for weeks in (4, 5):
-        candidate = outbound + timedelta(weeks=weeks)
+    for days in range(3, 6):  # 3, 4, 5 days
+        candidate = outbound + timedelta(days=days)
         if candidate.weekday() in {4, 5, 6, 0}:
             ret_dates.append(candidate.strftime("%Y-%m-%d"))
     return sorted(set(ret_dates))
@@ -181,19 +188,19 @@ def _search_roundtrip_sync(origin: str, dest: str, outbound: str, return_date: s
     if not results:
         return None
 
-    # Filter results for EXACTLY 4 or 5 week returns (with ±1 day tolerance)
+    # Filter results for 3-5 day returns (with ±1 day tolerance)
     for dp in results:
         if len(dp.date) > 1:
             out_str = dp.date[0].strftime("%Y-%m-%d")
             ret_str = dp.date[1].strftime("%Y-%m-%d")
             
-            # Verify the return is exactly 4 or 5 weeks after outbound (±1 day)
+            # Verify the return is 3-5 days after outbound (±1 day)
             out_dt = datetime.strptime(out_str, "%Y-%m-%d")
             ret_dt = datetime.strptime(ret_str, "%Y-%m-%d")
             days_diff = (ret_dt - out_dt).days
             
-            if not ((27 <= days_diff <= 29) or (34 <= days_diff <= 36)):
-                continue  # Not 4/5 weeks
+            if not (2 <= days_diff <= 6):  # 3-5 days ±1 day
+                continue
             
             if ret_dt.weekday() not in {4, 5, 6, 0}:
                 continue  # Not Fri/Sat/Sun/Mon
@@ -211,7 +218,7 @@ def _search_roundtrip_sync(origin: str, dest: str, outbound: str, return_date: s
 
 async def search_outbound(origin: str, dest: str) -> List[Dict]:
     """Async wrapper for outbound search."""
-    start_days, end_days = (60, 90)
+    start_days, end_days = SEARCH_WINDOW_DAYS
     today = datetime.now().date()
     from_date = (today + timedelta(days=start_days)).strftime("%Y-%m-%d")
     to_date = (today + timedelta(days=end_days)).strftime("%Y-%m-%d")
@@ -224,10 +231,7 @@ async def search_outbound(origin: str, dest: str) -> List[Dict]:
 
 
 async def search_roundtrip(origin: str, dest: str, outbound: str, return_date: str) -> Optional[Dict]:
-    """Async wrapper for roundtrip search with 4/5 week validation."""
-    if not _validate_return_week(outbound, return_date):
-        return None
-    
+    """Async wrapper for roundtrip search."""
     loop = asyncio.get_event_loop()
     with ThreadPoolExecutor(max_workers=4) as executor:
         return await loop.run_in_executor(
@@ -235,56 +239,53 @@ async def search_roundtrip(origin: str, dest: str, outbound: str, return_date: s
         )
 
 
-def _validate_return_week(outbound: str, return_date: str) -> bool:
-    """Check if return is exactly 4 or 5 weeks after outbound (±1 day tolerance)."""
-    out_dt = datetime.strptime(outbound, "%Y-%m-%d")
-    ret_dt = datetime.strptime(return_date, "%Y-%m-%d")
-    days_diff = (ret_dt - out_dt).days
-    # 4 weeks = 28 days, 5 weeks = 35 days, allow ±1 day
-    return (27 <= days_diff <= 29) or (34 <= days_diff <= 36)
-
-
 # ============ MAIN PIPELINE ============
 
 async def find_best_deals() -> tuple:
     """Main pipeline: fresh search every run, no state, returns (roundtrip_deals, top_outbound)."""
     log.info("=" * 60)
-    log.info(f"FLIGHT DEAL SEARCH: {', '.join(ORIGIN_AIRPORTS)} → {DESTINATION}")
+    log.info(f"FLIGHT DEAL SEARCH: {', '.join(ORIGIN_AIRPORTS)} → {', '.join(DESTINATION_AIRPORTS)}")
     log.info(f"Window: {SEARCH_WINDOW_DAYS[0]}-{SEARCH_WINDOW_DAYS[1]} days out")
-    log.info(f"Return: EXACTLY 4 or 5 weeks after departure")
+    log.info(f"Return: 3-5 days after departure (weekend trips)")
     log.info("=" * 60)
 
-    # Step 1: Search outbound dates for both origins IN PARALLEL
-    outbound_tasks = [search_outbound(origin, DESTINATION) for origin in ORIGIN_AIRPORTS]
+    # Step 1: Search outbound dates for all origins IN PARALLEL
+    outbound_tasks = [search_outbound(origin, dest) 
+                      for origin in ORIGIN_AIRPORTS 
+                      for dest in DESTINATION_AIRPORTS]
     all_outbound_results = await asyncio.gather(*outbound_tasks)
 
     all_outbound = []
     roundtrip_tasks = []
 
-    for origin, outbound_results in zip(ORIGIN_AIRPORTS, all_outbound_results):
-        if not outbound_results:
-            continue
+    idx = 0
+    for origin in ORIGIN_AIRPORTS:
+        for dest in DESTINATION_AIRPORTS:
+            outbound_results = all_outbound_results[idx]
+            idx += 1
+            if not outbound_results:
+                continue
 
-        # Collect top 5 outbound for display
-        for d in outbound_results[:5]:
+            # Collect top 5 outbound for display
+            for d in outbound_results[:5]:
                 link = (
-                    f"https://www.google.com/travel/flights?q=Flights+from+{origin}+to+{DESTINATION}"
+                    f"https://www.google.com/travel/flights?q=Flights+from+{origin}+to+{dest}"
                     f"+on+{d['date']}&curr=USD"
                 )
                 all_outbound.append({
                     "origin": origin,
-                    "destination": DESTINATION,
+                    "destination": dest,
                     "outbound_date": d["date"],
                     "outbound_price": d["price"],
                     "currency": d["currency"],
                     "booking_link": link,
                 })
 
-        # Queue roundtrip searches for top 8 outbound dates
-        for d in outbound_results[:8]:
-            ret_dates = generate_return_dates(d["date"])
-            for ret_date in ret_dates:
-                roundtrip_tasks.append(search_roundtrip(origin, DESTINATION, d["date"], ret_date))
+            # Queue roundtrip searches for top 8 outbound dates
+            for d in outbound_results[:8]:
+                ret_dates = generate_return_dates(d["date"])
+                for ret_date in ret_dates:
+                    roundtrip_tasks.append(search_roundtrip(origin, dest, d["date"], ret_date))
 
     # Step 2: Execute all roundtrip searches in parallel
     if roundtrip_tasks:
@@ -304,16 +305,15 @@ async def find_best_deals() -> tuple:
     top_outbound = all_outbound[:5]
 
     all_combos.sort(key=lambda x: x["total_price"])
-    top_combos = all_combos[:5]  # Only need top 5 for final display
+    top_combos = all_combos[:5]
 
-    # Build final deals from calendar data (no slow SearchFlights calls)
+    # Build final deals from calendar data
     deals = []
     for combo in top_combos:
         link = (
             f"https://www.google.com/travel/flights?q=Flights+from+{combo['origin']}"
             f"+to+{combo['destination']}+on+{combo['outbound']}+through+{combo['return']}&curr=USD"
         )
-        # Split total price roughly for display
         out_price = combo["total_price"] * 0.5
         ret_price = combo["total_price"] * 0.5
 
@@ -330,7 +330,7 @@ async def find_best_deals() -> tuple:
             duration_ret="-",
             stops_out=-1,
             stops_ret=-1,
-            baggage_info=f"{2} checked + 1 carry-on",
+            baggage_info="Carry-on only (domestic)",
             booking_link=link,
             source="google_flights_calendar",
         )
@@ -349,8 +349,8 @@ def format_telegram_message(deals: List, top_outbound: List[Dict]) -> str:
     today = datetime.now().strftime("%Y-%m-%d")
 
     lines = [
-        f"✈️ <b>Flight Deals: EWR/JFK → HYD</b>",
-        f"<i>60-90 days out • Fri/Sat/Sun/Mon only • Return EXACTLY 4 or 5 weeks later • 2 checked + 1 carry-on • Via Google Flights (fli)</i>",
+        f"✈️ <b>Flight Deals: NYC (JFK/LGA/EWR) → CA + Yellowstone</b>",
+        f"<i>20-35 days out • Fri/Sat/Sun/Mon only • Return 3-5 days later • Carry-on only • Via Google Flights (fli)</i>",
         "",
         "🔻 <b>Top 5 Cheapest Outbound (One-Way)</b>:"
     ]
@@ -421,7 +421,7 @@ def send_telegram(message: str) -> bool:
 # ============ ENTRY POINT ============
 
 async def main():
-    log.info("🚀 Starting Flight Deal Finder (Optimized)")
+    log.info("🚀 Starting Flight Deal Finder (NYC → CA + Yellowstone)")
 
     try:
         deals, top_outbound = await find_best_deals()
