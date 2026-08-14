@@ -84,6 +84,7 @@ def _search_outbound_sync(origin: str, dest: str, start_date: str, end_date: str
                 FlightSegment(
                     departure_airport=[[origin_ap, 0]],
                     arrival_airport=[[dest_ap, 0]],
+                    travel_date=start_date,  # Fixed: travel_date is required by Pydantic
                 )
             ],
             trip_type=TripType.ONE_WAY,
